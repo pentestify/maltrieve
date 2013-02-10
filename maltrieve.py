@@ -26,39 +26,43 @@ import os
 import sys
 import datetime
 import xml.etree.ElementTree as ET
-from threading import Thread 
-from Queue import Queue
+import multiprocessing
 
 from bs4 import BeautifulSoup
 
 from malutil import *
 
-NUMTHREADS = 4
-hashes = set()
-pasturls = set()
-now = datetime.datetime.now()
+NUMPROCS = 4
 
-def get_malware(q,dumpdir):
+# main worker function
+def get_malware(q,dumpdir, hashes):
     while True:
         url = q.get()
-        logging.info("Fetched URL %s from queue", url)
+        logging.debug("Fetched URL %s from queue", url)
         mal = get_URL(url)
         if mal:
             malfile=mal.read()
             md5 = hashlib.md5(malfile).hexdigest()
-            # Is this a big race condition problem?
             if md5 not in hashes:
                 logging.info("Found file %s at URL %s", md5, url)
-                logging.debug("Going to put file in directory %s", dumpdir)
                 # store the file and log the data
+                # TODO: replace with malwarehouse or vxcage integration
                 with open(os.path.join(dumpdir, md5), 'wb') as f:
                     f.write(malfile)
-                    logging.info("Stored %s in %s", md5, dumpdir)
-                hashes.add(md5)
-                pasturls.add(url)
+                hashes[md5] = True
         q.task_done()
 
-def get_XML_list(url,q):
+# logging
+
+def listener_configurer():
+    root = logging.getLogger()
+    h = logging.handlers.RotatingFileHandler('mptest.log', 'a', 300, 10)
+    f = logging.Formatter('%(asctime)s %(processName)-10s %(name)s %(levelname)-8s %(message)s')
+    h.setFormatter(f)
+    root.addHandler(h)
+
+# preprocessing
+def get_XML_list(url,q, pasturls):
     malwareurls = []
     descriptions = []
 
@@ -67,7 +71,7 @@ def get_XML_list(url,q):
         descriptions = tree.findall('channel/item/description')
 
     for d in descriptions:
-        logging.info('Parsing description %s', d.text)
+        logging.debug('Parsing description %s', d.text)
         url = d.text.split(' ')[1].rstrip(',')
         if url == '-':
             url = d.text.split(' ')[4].rstrip(',')
@@ -77,15 +81,27 @@ def get_XML_list(url,q):
         malwareurls.append(url)
 
     for url in malwareurls:
-        push_malware_URL(url,q)
+        push_malware_URL(url,q, pasturls)
 
-def push_malware_URL(url,q):
+def push_malware_URL(url,q, pasturls):
     url = url.strip()
     if url not in pasturls:
         q.put(url)
 
 def main():
-    malq = Queue()
+    malq = multiprocessing.JoinableQueue()
+    pasturls = set()
+    now = datetime.datetime.now()
+
+    # track which hashes we've already grabbed and saved
+    manager= multiprocessing.Manager()
+    hashes = manager.dict()
+
+    # logging isn't trivial anymore
+    logq = multiprocessing.Queue(-1)
+    listener = multiprocessing.Process(target=listener_process,
+                                       args=(logq,listener_configurer))
+    listener.start()
 
     parser = argparse.ArgumentParser()
 #   parser.add_argument("-t", "--thug", help="Enable thug analysis", action="store_true")
@@ -97,12 +113,15 @@ def main():
                         help="Define file for logging progress")
     args = parser.parse_args()
 
+    # TODO: make multiprocessing-safe
     if args.logfile:
-        logging.basicConfig(filename=args.logfile, level=logging.DEBUG, 
-                            format='%(asctime)s %(thread)d %(message)s', 
+        logging.basicConfig(filename=args.logfile, 
+                            level=logging.DEBUG, 
+                            format='%(asctime)s %(processName)s %(message)s', 
                             datefmt='%Y-%m-%d %H:%M:%S')
     else:
-        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(thread)d %(message)s', 
+        logging.basicConfig(level=logging.DEBUG, 
+                            format='%(asctime)s %(processName)s %(message)s', 
                             datefmt='%Y-%m-%d %H:%M:%S')
 
     # Enable thug support 
@@ -116,6 +135,7 @@ def main():
         logging.warning('Could not enable thug (%s)', e)
     '''
 
+    # TODO: test more thoroughly
     if args.proxy:
         proxy = urllib2.ProxyHandler({'http': args.proxy})
         opener = urllib2.build_opener(proxy)
@@ -124,7 +144,8 @@ def main():
         my_ip = urllib2.urlopen('http://whatthehellismyip.com/?ipraw').read()
         logging.info('External sites see %s',my_ip)
 
-    # http://stackoverflow.com/questions/14574889/verify-directory-write-privileges
+    # define where to save the malware we grab
+    # TODO: use malwarehouse or vxcage or similar
     if args.dumpdir:
         try:
             d = tempfile.mkdtemp(dir=args.dumpdir)
@@ -148,23 +169,25 @@ def main():
         with open('urls.obj', 'rb') as urlfile:
             pasturls = pickle.load(urlfile)
 
-    for i in range(NUMTHREADS):
-        worker = Thread(target=get_malware, args=(malq,dumpdir,))
-        worker.setDaemon(True)
+    for i in range(NUMPROCS):
+        worker = multiprocessing.Process(target=get_malware, 
+                                         args=(malq,dumpdir,hashes,))
+        worker.daemon = True
         worker.start()
     
-    get_XML_list('http://www.malwaredomainlist.com/hostslist/mdl.xml',malq)
-    get_XML_list('http://malc0de.com/rss',malq)
+    get_XML_list('http://www.malwaredomainlist.com/hostslist/mdl.xml',
+                 malq, pasturls)
+    get_XML_list('http://malc0de.com/rss',malq, pasturls)
     
     # TODO: wrap these in a function
     for url in get_URL('http://vxvault.siri-urz.net/URL_List.php'):
         if re.match('http', url):
-            push_malware_URL(url,malq)
+            push_malware_URL(url,malq, pasturls)
     
     sacourtext=get_URL('http://www.sacour.cn/showmal.asp?month=%d&year=%d' % 
                   (now.month, now.year)).read()
     for url in re.sub('\<[^>]*\>','\n',sacourtext).splitlines():
-        push_malware_URL(url,malq)
+        push_malware_URL(url,malq, pasturls)
     
     # appears offline
     # minotaur(parse('http://minotauranalysis.com/malwarelist-urls.aspx'))
@@ -173,14 +196,14 @@ def main():
     
     malq.join()
 
-    with open('hashes.obj','wb') as hashfile:
-        pickle.dump(hashfile, hashes)
-
-    with open('urls.obj', 'wb') as urlfile:
-        pickle.dump(urlfile, pasturls)
-
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         sys.exit()
+    else:
+        with open('hashes.obj','wb') as hashfile:
+            pickle.dump(hashfile, hashes)
+    
+        with open('urls.obj', 'wb') as urlfile:
+            pickle.dump(urlfile, pasturls)

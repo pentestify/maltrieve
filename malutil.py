@@ -4,11 +4,11 @@ import xml.etree.ElementTree as ET
 
 def get_URL(url):
     try:
-        response = urllib2.urlopen(url.encode("utf8"))
+        response = urllib2.urlopen(url.encode("utf8"), timeout=60)
         return response
     except urllib2.URLError, e:
         if hasattr(e,'reason'):
-            logging.warning('urlopen() returned error %s\n',e.reason)
+            logging.warning('urlopen(%s) returned error %s\n',url,e.reason)
         elif hasattr(e,'code'):
             logging.warning('Server couldn\'t fulfill request: %s\n',e.code)
         else:
