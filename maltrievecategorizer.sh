@@ -7,7 +7,7 @@ xlargestr="/xlarge"
 smallfile=50001
 mediumfile=1000001
 largefile=6000001
-root_dir="/media/malware/maltrievepulls/"
+root_dir="/media/sd/malware/maltrievepulls/"
 all_files="$root_dir*"
 for file in $all_files
 do
